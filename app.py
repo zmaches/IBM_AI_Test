@@ -1,226 +1,250 @@
+from flask import Flask, request, jsonify
+from datetime import datetime
 import json
 import os
-from datetime import datetime
-from flask import Flask, request, jsonify
 
-# ----------------------------
+# -----------------------------
 # Configuration and helpers
-# ----------------------------
+# -----------------------------
 
-# Data file name (in project root)
 DATA_FILE = 'courses.json'
-
-# Allowed statuses for a course
 ALLOWED_STATUSES = {"Not Started", "In Progress", "Completed"}
 
-# Ensure the data file exists; if not, create with an empty list
+# Ensure the data file exists (creates an empty list if missing)
 def ensure_data_file():
     if not os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, 'w', encoding='utf-8') as f:
-                json.dump([], f, indent=2)
-        except Exception as e:
-            # If we fail here, there's no point continuing; print for debugging
-            print(f"Error creating data file {DATA_FILE}: {e}")
+        dirpath = os.path.dirname(DATA_FILE)
+        if dirpath and not os.path.exists(dirpath):
+            os.makedirs(dirpath, exist_ok=True)
+        with open(DATA_FILE, 'w') as f:
+            json.dump([], f, indent=2)
 
 # Load courses from the JSON file
 def load_courses():
-    try:
-        with open(DATA_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        # If the file somehow disappears, recreate it and return empty list
-        ensure_data_file()
+    if not os.path.exists(DATA_FILE):
         return []
+    try:
+        with open(DATA_FILE, 'r') as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return data
+            else:
+                # If the file exists but doesn't contain a list, treat as empty
+                return []
     except json.JSONDecodeError:
-        # If the JSON is corrupted, reset to an empty list
+        # If the JSON is corrupted, treat as empty (optional: you could raise)
         return []
     except Exception as e:
-        # Re-raise for the caller to handle as a 500 error
-        raise e
+        # For unexpected IO errors, re-raise to be handled by caller
+        raise
 
-# Save the list of courses back to the JSON file
+# Save the entire list of courses back to the JSON file
 def save_courses(courses):
     try:
-        with open(DATA_FILE, 'w', encoding='utf-8') as f:
+        dirpath = os.path.dirname(DATA_FILE)
+        if dirpath and not os.path.exists(dirpath):
+            os.makedirs(dirpath, exist_ok=True)
+        with open(DATA_FILE, 'w') as f:
             json.dump(courses, f, indent=2)
-        return True
     except Exception as e:
-        # Re-raise so the caller can respond with a 500 error
-        raise e
+        # Re-raise so caller can convert to HTTP 500
+        raise
 
-# Generate the next auto-incrementing id (starting at 1)
-def get_next_id(courses):
+# Compute the next incremental id
+def next_id(courses):
     if not courses:
         return 1
-    return max(course['id'] for course in courses) + 1
+    max_id = max((c.get('id', 0) for c in courses), default=0)
+    return max_id + 1
 
-# Validate that target_date has the format YYYY-MM-DD
-def is_valid_target_date(date_str):
-    try:
-        datetime.strptime(date_str, "%Y-%m-%d")
-        return True
-    except (TypeError, ValueError):
-        return False
+# Validate payload for required fields and formats
+def validate_payload(payload, require_all=True):
+    if not isinstance(payload, dict):
+        return False, "Invalid payload: expected a JSON object"
 
-# Create the Flask app
+    if require_all:
+        required = ['name', 'description', 'target_date', 'status']
+        for key in required:
+            if key not in payload:
+                return False, f"Missing required field: {key}"
+
+    if 'target_date' in payload:
+        try:
+            datetime.strptime(payload['target_date'], "%Y-%m-%d")
+        except ValueError:
+            return False, "target_date must be in YYYY-MM-DD format"
+
+    if 'status' in payload:
+        if payload['status'] not in ALLOWED_STATUSES:
+            return False, f"Invalid status. Allowed values: {', '.join(ALLOWED_STATUSES)}"
+
+    return True, ""
+
+# -----------------------------
+# Flask app and routes
+# -----------------------------
+ensure_data_file()  # Create the data file if it doesn't exist
+
 app = Flask(__name__)
 
-# Ensure the data file exists when the app starts
-ensure_data_file()
+# Helper to return a consistent 500 on unexpected IO errors
+def handle_io_error(e):
+    # In production, log the error here
+    return jsonify({'error': 'Internal server error (IO)'}), 500
 
-# ----------------------------
-# Routes (CRUD)
-# ----------------------------
-
-# 1) Create a new course
-# POST /api/courses
+# POST /api/courses (also accepts /api/courses/)
 @app.route('/api/courses', methods=['POST'])
-def create_course():
-    try:
-        data = request.get_json(force=True) or {}
-    except Exception:
-        return jsonify({"error": "Invalid JSON payload"}), 400
+@app.route('/api/courses/', methods=['POST'])
+def add_course():
+    payload = request.get_json(silent=True)
+    if not payload:
+        return jsonify({'error': 'Request body must be JSON'}), 400
 
-    # Required fields
-    required_fields = ['name', 'description', 'target_date', 'status']
-
-    missing_fields = [f for f in required_fields if not data.get(f)]
-    if missing_fields:
-        return jsonify({
-            "error": "Missing required fields",
-            "missing_fields": missing_fields
-        }), 400
-
-    # Validate target_date format
-    if not is_valid_target_date(data['target_date']):
-        return jsonify({
-            "error": "Invalid target_date format. Expected YYYY-MM-DD."
-        }), 400
-
-    # Validate status value
-    status = data['status']
-    if status not in ALLOWED_STATUSES:
-        return jsonify({
-            "error": "Invalid status value",
-            "allowed": list(ALLOWED_STATUSES)
-        }), 400
+    ok, msg = validate_payload(payload, require_all=True)
+    if not ok:
+        return jsonify({'error': msg}), 400
 
     try:
         courses = load_courses()
-        new_id = get_next_id(courses)
-        created_at = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-
-        course = {
-            "id": new_id,
-            "name": data['name'],
-            "description": data['description'],
-            "target_date": data['target_date'],  # expected format: YYYY-MM-DD
-            "status": status,
-            "created_at": created_at
-        }
-
-        courses.append(course)
-        save_courses(courses)
-
-        return jsonify(course), 201
     except Exception as e:
-        # File I/O or other unexpected errors
-        return jsonify({"error": "Failed to create course", "detail": str(e)}), 500
+        return handle_io_error(e)
 
-# 2) Get all courses
-# GET /api/courses
+    new_id = next_id(courses)
+    created_at = datetime.utcnow().isoformat() + 'Z'
+
+    course = {
+        'id': new_id,
+        'name': payload['name'],
+        'description': payload['description'],
+        'target_date': payload['target_date'],
+        'status': payload['status'],
+        'created_at': created_at
+    }
+
+    courses.append(course)
+
+    try:
+        save_courses(courses)
+    except Exception as e:
+        return handle_io_error(e)
+
+    return jsonify(course), 201
+
+# GET /api/courses (also accepts /api/courses/)
+# - If ?id=X is provided, return a specific course
+# - If no id, return all courses
 @app.route('/api/courses', methods=['GET'])
-def get_all_courses():
+@app.route('/api/courses/', methods=['GET'])
+def get_courses():
     try:
         courses = load_courses()
-        return jsonify(courses), 200
     except Exception as e:
-        return jsonify({"error": "Failed to read courses", "detail": str(e)}), 500
+        return jsonify({'error': 'Unable to read data file'}), 500
 
-# 3) Get a specific course by id
-# GET /api/courses/<int:course_id>
-@app.route('/api/courses/<int:course_id>', methods=['GET'])
-def get_course(course_id):
-    try:
-        courses = load_courses()
-        course = next((c for c in courses if c['id'] == course_id), None)
+    # If the client asked for a specific course by id
+    cid = request.args.get('id')
+    if cid is not None:
+        try:
+            cid_int = int(cid)
+        except ValueError:
+            return jsonify({'error': 'Invalid id'}), 400
+
+        course = next((c for c in courses if c.get('id') == cid_int), None)
         if course is None:
-            return jsonify({"error": "Course not found"}), 404
-        return jsonify(course), 200
-    except Exception as e:
-        return jsonify({"error": "Failed to read course", "detail": str(e)}), 500
+            return jsonify({'error': 'Course not found'}), 404
+        return jsonify(course)
 
-# 4) Update a course
-# PUT /api/courses/<int:course_id>
-# For PUT, we replace allowed fields. All fields (name, description, target_date, status)
-# are required in the update payload to keep behavior explicit.
-@app.route('/api/courses/<int:course_id>', methods=['PUT'])
-def update_course(course_id):
-    try:
-        data = request.get_json(force=True) or {}
-    except Exception:
-        return jsonify({"error": "Invalid JSON payload"}), 400
+    # No id provided; return all courses
+    return jsonify(courses)
 
-    # Required fields for a full update
-    required_fields = ['name', 'description', 'target_date', 'status']
-    missing_fields = [f for f in required_fields if f not in data or not data.get(f)]
-    if missing_fields:
-        return jsonify({
-            "error": "Missing required fields for update",
-            "missing_fields": missing_fields
-        }), 400
+# PUT /api/courses (also /api/courses/)
+# Full update of a course; requires id and all fields
+@app.route('/api/courses', methods=['PUT'])
+@app.route('/api/courses/', methods=['PUT'])
+def update_course():
+    payload = request.get_json(silent=True)
+    if not payload:
+        return jsonify({'error': 'Request body must be JSON'}), 400
 
-    # Validate target_date format
-    if not is_valid_target_date(data['target_date']):
-        return jsonify({"error": "Invalid target_date format. Expected YYYY-MM-DD."}), 400
+    if 'id' not in payload:
+        return jsonify({'error': 'Missing field: id'}), 400
 
-    # Validate status value
-    status = data['status']
-    if status not in ALLOWED_STATUSES:
-        return jsonify({
-            "error": "Invalid status value",
-            "allowed": list(ALLOWED_STATUSES)
-        }), 400
+    ok, msg = validate_payload(payload, require_all=True)
+    if not ok:
+        return jsonify({'error': msg}), 400
 
     try:
         courses = load_courses()
-        course = next((c for c in courses if c['id'] == course_id), None)
-        if course is None:
-            return jsonify({"error": "Course not found"}), 404
-
-        # Preserve created_at; update fields
-        course['name'] = data['name']
-        course['description'] = data['description']
-        course['target_date'] = data['target_date']
-        course['status'] = status
-
-        save_courses(courses)
-        return jsonify(course), 200
     except Exception as e:
-        return jsonify({"error": "Failed to update course", "detail": str(e)}), 500
+        return jsonify({'error': 'Unable to read data file'}), 500
 
-# 5) Delete a course
-# DELETE /api/courses/<int:course_id>
-@app.route('/api/courses/<int:course_id>', methods=['DELETE'])
-def delete_course(course_id):
+    cid = payload['id']
+    for idx, c in enumerate(courses):
+        if c.get('id') == cid:
+            # Preserve created_at; if it somehow wasn't present, create one
+            created_at = c.get('created_at', datetime.utcnow().isoformat() + 'Z')
+            updated = {
+                'id': cid,
+                'name': payload['name'],
+                'description': payload['description'],
+                'target_date': payload['target_date'],
+                'status': payload['status'],
+                'created_at': created_at
+            }
+            courses[idx] = updated
+
+            try:
+                save_courses(courses)
+            except Exception as e:
+                return handle_io_error(e)
+
+            return jsonify(updated)
+
+    return jsonify({'error': 'Course not found'}), 404
+
+# DELETE /api/courses (also /api/courses/)
+# Delete a course by id (id can be in JSON body or query param ?id=)
+@app.route('/api/courses', methods=['DELETE'])
+@app.route('/api/courses/', methods=['DELETE'])
+def delete_course():
+    payload = request.get_json(silent=True)
+    cid = None
+
+    # Try to get id from JSON body
+    if isinstance(payload, dict) and 'id' in payload:
+        cid = payload['id']
+
+    # If not in body, try query parameter
+    if cid is None:
+        qid = request.args.get('id')
+        if qid is not None:
+            try:
+                cid = int(qid)
+            except ValueError:
+                return jsonify({'error': 'Invalid id'}), 400
+
+    if cid is None:
+        return jsonify({'error': 'Missing field: id'}), 400
+
     try:
         courses = load_courses()
-        index = next((i for i, c in enumerate(courses) if c['id'] == course_id), None)
-        if index is None:
-            return jsonify({"error": "Course not found"}), 404
-
-        removed_course = courses.pop(index)
-        save_courses(courses)
-        return jsonify({"message": "Course deleted", "course": removed_course}), 200
     except Exception as e:
-        return jsonify({"error": "Failed to delete course", "detail": str(e)}), 500
+        return jsonify({'error': 'Unable to read data file'}), 500
 
-# ----------------------------
+    for i, c in enumerate(courses):
+        if c.get('id') == cid:
+            removed = courses.pop(i)
+            try:
+                save_courses(courses)
+            except Exception as e:
+                return handle_io_error(e)
+            return jsonify(removed)
+
+    return jsonify({'error': 'Course not found'}), 404
+
+# -----------------------------
 # Run the app
-# ----------------------------
+# -----------------------------
 if __name__ == '__main__':
-    # Ensure the data file exists before starting the server
-    ensure_data_file()
-    # Run the Flask development server
+    # Running in debug mode is convenient for beginners, but disable in production
     app.run(debug=True)
